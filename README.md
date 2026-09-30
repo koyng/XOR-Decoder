@@ -17,3 +17,8 @@ decomp.txt : 붙여넣은 디컴파일 텍스트를 저장한 파일
 --image-base : Ghidra 표시주소 - 실제 가상주소 (PIE ELF 기본 0x100000)
 
 pip install pyelftools 필요
+
+
+결과 예시 -
+
+<img width="826" height="164" alt="image" src="https://github.com/user-attachments/assets/6e0f863b-fd4a-4f02-8985-d38f19babda8" />
