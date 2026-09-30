@@ -9,6 +9,7 @@ Ghidra 디컴파일 XOR 디코딩 루틴을 바이너리에 적용해 결과 바
 
 사용법:
   python xor_decode.py decomp.txt target.bin --image-base 0x100000
+  
   (target.bin 이 ELF이면 pyelftools 로 가상주소->파일오프셋 매핑, 없으면 --raw 로 평면 이미지 취급)
 
 decomp.txt : 붙여넣은 디컴파일 텍스트를 저장한 파일
