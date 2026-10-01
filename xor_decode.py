@@ -3,8 +3,23 @@ import argparse
 import re
 import sys
 
-LINE_RE = re.compile(r"^\s*(\w+)\s*=\s*(.+?)\s*;\s*$")
+LINE_RE = re.compile(r"^\s*([\w.]+)\s*=\s*(.+?)\s*;\s*$")
 DAT_RE = re.compile(r"^DAT_([0-9a-fA-F]+)$")
+# Ghidra가 4/8바이트 변수의 일부 바이트만 쓸 때 쓰는 표기: DAT_xxxxxx._N_1_ (N번째 바이트, 1바이트)
+SUBFIELD_RE = re.compile(r"^DAT_([0-9a-fA-F]+)\._(\d+)_(\d+)_$")
+
+
+def resolve_addr(tok):
+    """DAT_xxxxxx 또는 DAT_xxxxxx._N_1_ 형태를 실제 주소(int)로 변환. 해당 없으면 None."""
+    m = SUBFIELD_RE.match(tok)
+    if m:
+        base = int(m.group(1), 16)
+        off = int(m.group(2))
+        return base + off
+    m = DAT_RE.match(tok)
+    if m:
+        return int(m.group(1), 16)
+    return None
 
 
 def parse_int(s):
@@ -62,35 +77,43 @@ def main():
     def get(tok):
         tok = tok.strip()
         tok = re.sub(r"^\(\w+\)", "", tok).strip()  # (undefined1) 캐스트 제거
-        m = DAT_RE.match(tok)
-        if m:
-            a = int(m.group(1), 16)
-            return written[a] if a in written else mem.read(a)
+        addr = resolve_addr(tok)
+        if addr is not None:
+            return written[addr] if addr in written else mem.read(addr)
         if tok in local:
             return local[tok]
         return parse_int(tok)
 
     def store(name, val):
         val &= 0xFF
-        m = DAT_RE.match(name)
-        if m:
-            written[int(m.group(1), 16)] = val
+        addr = resolve_addr(name)
+        if addr is not None:
+            written[addr] = val
         else:
             local[name] = val
 
-    for line in open(args.decomp, encoding="utf-8", errors="ignore"):
+    skipped = 0
+    for lineno, line in enumerate(open(args.decomp, encoding="utf-8", errors="ignore"), 1):
         m = LINE_RE.match(line)
         if not m:
             continue
         dst, rhs = m.groups()
-        if rhs.startswith("~"):
-            val = ~get(rhs[1:])
-        elif "^" in rhs:
-            a, b = rhs.split("^", 1)
-            val = get(a) ^ get(b)
-        else:
-            val = get(rhs)
-        store(dst, val)
+        try:
+            if rhs.startswith("~"):
+                val = ~get(rhs[1:])
+            elif "^" in rhs:
+                a, b = rhs.split("^", 1)
+                val = get(a) ^ get(b)
+            else:
+                val = get(rhs)
+            store(dst, val)
+        except (ValueError, KeyError) as e:
+            # XOR 디코딩 체인과 무관한 변수(lVar1 등)가 섞여 있으면 그 줄만 건너뛴다
+            skipped += 1
+            print(f"[스킵] {lineno}행: {line.strip()}  ({e})", file=sys.stderr)
+
+    if skipped:
+        print(f"[경고] 총 {skipped}줄을 해석하지 못해 건너뛰었습니다.", file=sys.stderr)
 
     # 연속 구간으로 묶어서 출력
     addrs = sorted(written)
