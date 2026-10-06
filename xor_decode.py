@@ -1,139 +1,134 @@
-#!/usr/bin/env python3
 import argparse
-import re
 import sys
 
-LINE_RE = re.compile(r"^\s*([\w.]+)\s*=\s*(.+?)\s*;\s*$")
-DAT_RE = re.compile(r"^DAT_([0-9a-fA-F]+)$")
-# Ghidra가 4/8바이트 변수의 일부 바이트만 쓸 때 쓰는 표기: DAT_xxxxxx._N_1_ (N번째 바이트, 1바이트)
-SUBFIELD_RE = re.compile(r"^DAT_([0-9a-fA-F]+)\._(\d+)_(\d+)_$")
+PAGE = 0x1000
 
 
-def resolve_addr(tok):
-    """DAT_xxxxxx 또는 DAT_xxxxxx._N_1_ 형태를 실제 주소(int)로 변환. 해당 없으면 None."""
-    m = SUBFIELD_RE.match(tok)
-    if m:
-        base = int(m.group(1), 16)
-        off = int(m.group(2))
-        return base + off
-    m = DAT_RE.match(tok)
-    if m:
-        return int(m.group(1), 16)
-    return None
+def align_down(x, page=PAGE):
+    return x & ~(page - 1)
 
 
-def parse_int(s):
-    s = s.strip()
-    return int(s, 16) if s.lower().startswith("0x") else int(s)
+def align_up(x, page=PAGE):
+    return (x + page - 1) & ~(page - 1)
 
 
-class Memory:
-    def __init__(self, path, image_base, raw):
-        self.image_base = image_base
-        self.data = open(path, "rb").read()
-        self.segments = []  # (vaddr, filesz, offset)
-        self.raw = raw
-        if not raw:
-            try:
-                from elftools.elf.elffile import ELFFile
-                with open(path, "rb") as f:
-                    elf = ELFFile(f)
-                    for seg in elf.iter_segments():
-                        if seg["p_type"] == "PT_LOAD":
-                            self.segments.append(
-                                (seg["p_vaddr"], seg["p_filesz"], seg["p_offset"]))
-            except Exception as e:  # pyelftools 없음/ELF 아님
-                print(f"[경고] ELF 파싱 실패({e}); 평면 이미지로 처리", file=sys.stderr)
-                self.raw = True
-
-    def read(self, ghidra_addr):
-        va = ghidra_addr - self.image_base
-        if self.raw:
-            off = va
-        else:
-            for base, size, off0 in self.segments:
-                if base <= va < base + size:
-                    off = off0 + (va - base)
-                    break
-            else:
-                return 0  # .bss 등 파일에 없는 영역은 0
-        if 0 <= off < len(self.data):
-            return self.data[off]
-        return 0
+def load_elf(path):
+    from elftools.elf.elffile import ELFFile
+    data = open(path, "rb").read()
+    with open(path, "rb") as f:
+        elf = ELFFile(f)
+        segs = []
+        for seg in elf.iter_segments():
+            if seg["p_type"] == "PT_LOAD":
+                segs.append({
+                    "vaddr": seg["p_vaddr"],
+                    "memsz": seg["p_memsz"],
+                    "filesz": seg["p_filesz"],
+                    "offset": seg["p_offset"],
+                })
+    return data, segs
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("decomp")
-    ap.add_argument("binary")
-    ap.add_argument("--image-base", type=lambda x: int(x, 0), default=0x100000)
-    ap.add_argument("--raw", action="store_true", help="바이너리를 평면 이미지로 취급")
-    args = ap.parse_args()
+def run(so_path, func_vaddr, timeout_us, max_insn, arg_regs):
+    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UcError
+    from unicorn.arm64_const import (
+        UC_ARM64_REG_SP, UC_ARM64_REG_LR,
+        UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
+        UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7,
+    )
 
-    mem = Memory(args.binary, args.image_base, args.raw)
-    written = {}   # 주소 -> 값 (실행 중 덮어쓴 바이트)
-    local = {}     # local_xx 변수
+    data, segs = load_elf(so_path)
+    uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
 
-    def get(tok):
-        tok = tok.strip()
-        tok = re.sub(r"^\(\w+\)", "", tok).strip()  # (undefined1) 캐스트 제거
-        addr = resolve_addr(tok)
-        if addr is not None:
-            return written[addr] if addr in written else mem.read(addr)
-        if tok in local:
-            return local[tok]
-        return parse_int(tok)
+    bounds = []
+    for seg in segs:
+        start = align_down(seg["vaddr"])
+        end = align_up(seg["vaddr"] + seg["memsz"])
+        size = end - start
+        uc.mem_map(start, size)
+        chunk = bytearray(size)
+        file_bytes = data[seg["offset"]: seg["offset"] + seg["filesz"]]
+        rel = seg["vaddr"] - start
+        chunk[rel:rel + len(file_bytes)] = file_bytes
+        uc.mem_write(start, bytes(chunk))
+        bounds.append((start, size))
 
-    def store(name, val):
-        val &= 0xFF
-        addr = resolve_addr(name)
-        if addr is not None:
-            written[addr] = val
-        else:
-            local[name] = val
+    snapshot = {start: bytes(uc.mem_read(start, size)) for start, size in bounds}
 
-    skipped = 0
-    for lineno, line in enumerate(open(args.decomp, encoding="utf-8", errors="ignore"), 1):
-        m = LINE_RE.match(line)
-        if not m:
-            continue
-        dst, rhs = m.groups()
-        try:
-            if rhs.startswith("~"):
-                val = ~get(rhs[1:])
-            elif "^" in rhs:
-                a, b = rhs.split("^", 1)
-                val = get(a) ^ get(b)
-            else:
-                val = get(rhs)
-            store(dst, val)
-        except (ValueError, KeyError) as e:
-            # XOR 디코딩 체인과 무관한 변수(lVar1 등)가 섞여 있으면 그 줄만 건너뛴다
-            skipped += 1
-            print(f"[스킵] {lineno}행: {line.strip()}  ({e})", file=sys.stderr)
+    STACK_ADDR = 0x7f0000000000
+    STACK_SIZE = 0x100000
+    RETURN_ADDR = 0x7f1000000000  # 여기로 복귀하면 함수가 끝난 것으로 간주
 
-    if skipped:
-        print(f"[경고] 총 {skipped}줄을 해석하지 못해 건너뛰었습니다.", file=sys.stderr)
+    uc.mem_map(STACK_ADDR, STACK_SIZE)
+    sp = STACK_ADDR + STACK_SIZE - 0x1000
+    uc.mem_map(align_down(RETURN_ADDR), PAGE)
 
-    # 연속 구간으로 묶어서 출력
-    addrs = sorted(written)
-    runs, start, prev = [], None, None
-    for a in addrs:
-        if start is None:
-            start = prev = a
-        elif a == prev + 1:
+    uc.reg_write(UC_ARM64_REG_SP, sp)
+    uc.reg_write(UC_ARM64_REG_LR, RETURN_ADDR)
+    regs = [UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
+            UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7]
+    for i, reg in enumerate(regs):
+        uc.reg_write(reg, arg_regs[i] if i < len(arg_regs) else 0)
+
+    status = "정상 종료 (ret)"
+    try:
+        uc.emu_start(func_vaddr, RETURN_ADDR, timeout=timeout_us, count=max_insn)
+    except UcError as e:
+        status = f"중단됨: {e}"
+
+    changed = {}
+    for start, size in bounds:
+        cur = uc.mem_read(start, size)
+        orig = snapshot[start]
+        for i in range(size):
+            if cur[i] != orig[i]:
+                changed[start + i] = cur[i]
+
+    return status, changed
+
+
+def print_runs(changed, image_base):
+    addrs = sorted(changed)
+    if not addrs:
+        print("바뀐 바이트가 없습니다 (함수가 다른 로직이거나, 실행이 초반에 중단됐을 수 있습니다).")
+        return
+    start = prev = addrs[0]
+    runs = []
+    for a in addrs[1:]:
+        if a == prev + 1:
             prev = a
         else:
             runs.append((start, prev))
             start = prev = a
-    if start is not None:
-        runs.append((start, prev))
+    runs.append((start, prev))
 
     for s, e in runs:
-        bs = bytes(written[a] for a in range(s, e + 1))
-        print(f"\n[{s:08x}-{e:08x}] {len(bs)} bytes")
-        print("hex :", bs.hex(" "))
+        bs = bytes(changed[a] for a in range(s, e + 1))
+        gs, ge = s + image_base, e + image_base
+        print(f"\n[{gs:08x}-{ge:08x}] {len(bs)} bytes")
+        print("hex  :", bs.hex(" "))
         print("ascii:", "".join(chr(b) if 32 <= b < 127 else "." for b in bs))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("binary")
+    ap.add_argument("func_addr", help="Ghidra 상 함수 시작 주소, 예: 0x0011b658")
+    ap.add_argument("--image-base", type=lambda x: int(x, 0), default=0x100000)
+    ap.add_argument("--timeout-ms", type=int, default=2000)
+    ap.add_argument("--max-insn", type=int, default=2_000_000)
+    ap.add_argument("--arg", action="append", default=[],
+                     help="x0,x1,... 에 넣을 값 (16진수). 여러 번 지정 가능, 순서대로 x0,x1,...")
+    args = ap.parse_args()
+
+    ghidra_addr = int(args.func_addr, 16)
+    func_vaddr = ghidra_addr - args.image_base
+    arg_regs = [int(a, 16) for a in args.arg]
+
+    status, changed = run(args.binary, func_vaddr, args.timeout_ms * 1000, args.max_insn, arg_regs)
+    print(f"[실행 결과] {status}")
+    print(f"[변경된 바이트 수] {len(changed)}")
+    print_runs(changed, args.image_base)
 
 
 if __name__ == "__main__":
