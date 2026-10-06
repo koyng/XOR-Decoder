@@ -36,5 +36,6 @@ decode_all.py
 
 사용법:
     python decode_all.py <so파일명> --image-base 0x100000
+    
     python decode_all.py <so파일명> --image-base 0x100000 --out strings.txt --top 20
 
