@@ -1,20 +1,3 @@
-"""
-decode_all.py
---------------
-.so 파일 하나만 주면:
-  1) 심볼 테이블 + .text 프롤로그 휴리스틱으로 함수 목록을 뽑고
-  2) 각 함수를 디스어셈블해서 ldrb/strb + eor/mvn 밀도로 'XOR 디코딩 루틴' 후보를 추리고
-  3) 후보 함수들을 Unicorn 으로 실제 실행해서, 실행 전/후 바뀐 메모리를 찾아
-  4) 어느 함수에서 나온 문자열인지와 함께 ascii 로 출력 + 파일 저장
-까지 한 번에 처리한다. (기기/에뮬레이터 불필요)
-
-설치:
-    pip install capstone pyelftools unicorn
-
-사용법:
-    python decode_all.py libAppIron-jni_v2.13.27.so --image-base 0x100000
-    python decode_all.py lib.so --image-base 0x100000 --out strings.txt --top 20
-"""
 import argparse
 
 PAGE = 0x1000
